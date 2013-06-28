@@ -12,7 +12,6 @@
 
 (define-struct task-server
   (queue
-   timers
    events)
   #:constructor-name task-server
   #:mutable)
@@ -20,7 +19,7 @@
 
 (define/contract (make-task-server)
                  (-> task-server?)
-  (task-server (make-async-channel) (make-hasheq) (make-hasheq)))
+  (task-server (make-async-channel) (make-hasheq)))
 
 
 (define current-task-server
@@ -37,26 +36,16 @@
                  (->* () ((or/c #f task-server?)) void?)
   (let* ((task-server (or task-server (current-task-server)))
          (queue       (task-server-queue task-server))
-         (timers      (task-server-timers task-server))
          (events      (task-server-events task-server)))
 
-    (define (self-wrap evt)
-      (wrap-evt evt (lambda (result)
-                      (cons evt result))))
-
     (define (next)
-      (sync queue (apply choice-evt (hash-keys timers))
-                  (apply choice-evt (map self-wrap (hash-keys events)))))
+      (apply sync queue (hash-keys events)))
 
     (for ((task (in-producer next #f)))
       (cond
-        ((hash-has-key? timers task)
-         (let ((real-task (hash-ref timers task)))
-           (hash-remove! timers task)
-           (real-task)))
-
         ((pair? task)
          (let ((real-task (hash-ref events (car task))))
+           (hash-remove! events (car task))
            (real-task (cdr task))))
 
         (else
@@ -77,10 +66,9 @@
 
 (define/contract (schedule-delayed-task proc secs (task-server #f))
                  (->* ((-> any) integer?) ((or/c #f task-server?)) void?)
-  (let ((task-server (or task-server (current-task-server))))
-    (hash-set! (task-server-timers task-server)
-               (alarm-evt (+ (current-inexact-milliseconds) (* 1000 secs)))
-               proc)))
+  (let ((task-server (or task-server (current-task-server)))
+        (alarm (alarm-evt (+ (current-inexact-milliseconds) (* 1000 secs)))))
+    (schedule-event-task (lambda (alarm) (proc)) alarm)))
 
 
 (define/contract (schedule-recurring-task proc secs (task-server #f))
@@ -89,13 +77,24 @@
     (schedule-delayed-task wrapper secs task-server)
     (proc))
 
-  (wrapper))
+  (schedule-task wrapper))
 
 
-(define/contract (schedule-sync-task proc evt (task-server #f))
+(define/contract (schedule-event-task proc evt (task-server #f))
                  (->* ((-> any/c any) evt?) ((or/c #f task-server?)) void?)
-  (let ((task-server (or task-server (current-task-server))))
-    (hash-set! (task-server-events task-server) evt proc)))
+  (define wrapped-evt (handle-evt evt (lambda (result)
+                                        (cons wrapped-evt result))))
+  (let ((events (task-server-events (or task-server (current-task-server)))))
+    (hash-set! events wrapped-evt proc)))
+
+
+(define/contract (schedule-recurring-event-task proc evt (task-server #f))
+                 (->* ((-> any/c any) evt?) ((or/c #f task-server?)) void?)
+  (define (wrapper result)
+    (schedule-event-task wrapper evt task-server)
+    (proc result))
+
+  (schedule-event-task wrapper evt task-server))
 
 
 (define-syntax-rule (with-task-server body ...)
@@ -118,8 +117,15 @@
     (thunk body ...) delay))
 
 
-(define-syntax-rule (sync-task (name event) body ...)
-  (schedule-sync-task
+(define-syntax-rule (event-task (name event) body ...)
+  (schedule-event-task
+    (lambda (name)
+      body ...)
+    event))
+
+
+(define-syntax-rule (recurring-event-task (name event) body ...)
+  (schedule-recurring-event-task
     (lambda (name)
       body ...)
     event))
