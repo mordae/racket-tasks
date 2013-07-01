@@ -7,7 +7,8 @@
          racket/function
          racket/async-channel)
 
-(provide (except-out (all-defined-out) task-server))
+(provide (except-out (all-defined-out)
+                     task-server task-server-queue task-server-events))
 
 
 (define-struct task-server
