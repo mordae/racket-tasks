@@ -83,8 +83,8 @@
 
 (define/contract (schedule-event-task proc evt (task-server #f))
                  (->* ((-> any/c any) evt?) ((or/c #f task-server?)) void?)
-  (define wrapped-evt (handle-evt evt (lambda (result)
-                                        (cons wrapped-evt result))))
+  (define wrapped-evt (wrap-evt evt (lambda (result)
+                                      (cons wrapped-evt result))))
   (let ((events (task-server-events (or task-server (current-task-server)))))
     (hash-set! events wrapped-evt proc)))
 
