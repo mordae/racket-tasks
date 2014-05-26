@@ -2,134 +2,139 @@
 ;
 ; Task Server
 ;
+; Enables event-driven programming using a central poller and
+; a number of callback procedures.
+;
 
 (require racket/contract
-         racket/function
-         racket/async-channel)
+         racket/set)
 
-(provide (except-out (all-defined-out)
-                     task-server task-server-queue task-server-events))
+(provide
+  (contract-out
+    (task-server? predicate/c)
+    (rename make-task-server task-server (-> task-server?))
+    (current-task-server (parameter/c task-server?))
+    (call-with-task-server (-> (-> any) any))
+    (run-tasks (->* () (task-server?) void?))
+    (schedule-stop-task (->* () (task-server?) void?))
+    (schedule-task (->* ((-> any)) (task-server?) void?))
+    (schedule-delayed-task (->* ((-> any) real?) (task-server?) void?))
+    (schedule-recurring-task (->* ((-> any) real?) (task-server?) void?))
+    (schedule-recurring-event-task (->* (procedure? evt?) (task-server?) void?))
+    (schedule-event-task (->* (procedure? evt?) (task-server?) void?))))
+
+(provide
+  with-task-server
+  stop-task
+  task
+  delayed-task
+  recurring-task
+  event-task
+  recurring-event-task)
 
 
-(define-struct task-server
-  (queue
-   events)
-  #:constructor-name task-server
-  #:mutable)
+(struct task-server
+  (refresh stop events))
 
 
-(define/contract (make-task-server)
-                 (-> task-server?)
-  (task-server (make-async-channel) (make-hasheq)))
+(define (make-task-server)
+  (task-server (make-semaphore) (make-semaphore) (mutable-seteq)))
 
 
 (define current-task-server
   (make-parameter (make-task-server)))
 
 
-(define/contract (call-with-task-server proc)
-                 (-> (-> any) any)
+(define (call-with-task-server proc)
   (parameterize ((current-task-server (make-task-server)))
     (proc)))
 
 
-(define/contract (run-tasks (task-server #f))
-                 (->* () ((or/c #f task-server?)) void?)
-  (let* ((task-server (or task-server (current-task-server)))
-         (queue       (task-server-queue task-server))
-         (events      (task-server-events task-server)))
+(define (run-tasks (task-server (current-task-server)))
+  (define refresh (task-server-refresh task-server))
+  (define stop    (task-server-stop    task-server))
+  (define events  (task-server-events  task-server))
 
-    (define (next)
-      (apply sync queue (hash-keys events)))
+  (define (next)
+    (apply sync refresh stop (set->list events)))
 
-    (for ((task (in-producer next #f)))
-      (cond
-        ((pair? task)
-         (let ((real-task (hash-ref events (car task))))
-           (hash-remove! events (car task))
-           (real-task (cdr task))))
-
-        (else
-         (task))))))
+  (for ((evt (in-producer next stop)))
+    (void)))
 
 
-(define/contract (schedule-stop-task (task-server #f))
-                 (->* () ((or/c #f task-server?)) void?)
-  (let ((queue (task-server-queue (or task-server (current-task-server)))))
-    (async-channel-put queue #f)))
+(define (schedule-stop-task (task-server (current-task-server)))
+  (semaphore-post (task-server-stop task-server)))
 
 
-(define/contract (schedule-task proc (task-server #f))
-                 (->* ((-> any)) ((or/c #f task-server?)) void?)
-  (let ((queue (task-server-queue (or task-server (current-task-server)))))
-    (async-channel-put queue proc)))
+(define (schedule-event-task proc evt (task-server (current-task-server)))
+  (define refresh (task-server-refresh task-server))
+  (define events  (task-server-events task-server))
+
+  (define wrapped-evt
+    (handle-evt evt (λ args
+                      (set-remove! events wrapped-evt)
+                      (apply proc args))))
+
+  (set-add! events wrapped-evt)
+  (semaphore-post refresh))
 
 
-(define/contract (schedule-delayed-task proc secs (task-server #f))
-                 (->* ((-> any) integer?) ((or/c #f task-server?)) void?)
-  (let ((task-server (or task-server (current-task-server)))
-        (alarm (alarm-evt (+ (current-inexact-milliseconds) (* 1000 secs)))))
-    (schedule-event-task (lambda (alarm) (proc)) alarm)))
+(define (schedule-recurring-event-task proc evt (task-server
+                                                  (current-task-server)))
+  (define (recurring-wrapper . results)
+    (schedule-event-task recurring-wrapper evt task-server)
+    (apply proc results))
+
+  (schedule-event-task recurring-wrapper evt task-server))
 
 
-(define/contract (schedule-recurring-task proc secs (task-server #f))
-                 (->* ((-> any) integer?) ((or/c #f task-server?)) void?)
-  (define (wrapper)
-    (schedule-delayed-task wrapper secs task-server)
+(define (schedule-task proc (task-server (current-task-server)))
+  (schedule-event-task (λ _ (proc)) always-evt task-server))
+
+
+(define (schedule-delayed-task proc secs (task-server (current-task-server)))
+  (let ((at (+ (current-inexact-milliseconds) (* 1000 secs))))
+    (schedule-event-task (λ _ (proc)) (alarm-evt at) task-server)))
+
+
+(define (schedule-recurring-task proc secs (task-server (current-task-server)))
+  (define (recurring-wrapper)
+    (schedule-delayed-task recurring-wrapper secs task-server)
     (proc))
 
-  (schedule-task wrapper))
-
-
-(define/contract (schedule-event-task proc evt (task-server #f))
-                 (->* ((-> any/c any) evt?) ((or/c #f task-server?)) void?)
-  (define wrapped-evt (wrap-evt evt (lambda (result)
-                                      (cons wrapped-evt result))))
-  (let ((events (task-server-events (or task-server (current-task-server)))))
-    (hash-set! events wrapped-evt proc)))
-
-
-(define/contract (schedule-recurring-event-task proc evt (task-server #f))
-                 (->* ((-> any/c any) evt?) ((or/c #f task-server?)) void?)
-  (define (wrapper result)
-    (schedule-event-task wrapper evt task-server)
-    (proc result))
-
-  (schedule-event-task wrapper evt task-server))
+  (schedule-task recurring-wrapper task-server))
 
 
 (define-syntax-rule (with-task-server body ...)
   (call-with-task-server
-    (thunk body ...)))
+    (λ () body ...)))
+
+
+(define-syntax-rule (stop-task)
+  (schedule-stop-task))
 
 
 (define-syntax-rule (task body ...)
   (schedule-task
-    (thunk body ...)))
+    (λ () body ...)))
 
 
 (define-syntax-rule (recurring-task delay body ...)
   (schedule-recurring-task
-    (thunk body ...) delay))
+    (λ () body ...) delay))
 
 
 (define-syntax-rule (delayed-task delay body ...)
   (schedule-delayed-task
-    (thunk body ...) delay))
+    (λ () body ...) delay))
 
 
-(define-syntax-rule (event-task (name event) body ...)
-  (schedule-event-task
-    (lambda (name)
-      body ...)
-    event))
+(define-syntax-rule (event-task (evt . args) body ...)
+  (schedule-event-task (λ args body ...) evt))
 
 
-(define-syntax-rule (recurring-event-task (name event) body ...)
-  (schedule-recurring-event-task
-    (lambda (name)
-      body ...)
-    event))
+(define-syntax-rule (recurring-event-task (evt . args) body ...)
+  (schedule-recurring-event-task (λ args body ...) evt))
 
 
 ; vim:set ts=2 sw=2 et:
